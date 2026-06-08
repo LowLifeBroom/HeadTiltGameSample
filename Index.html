@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Head Tilt Surfer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; }
+        canvas { display: block; }
+        
+        #webcam-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 200px;
+            height: 200px; /* Sized to fit pose canvas and labels */
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid #fff;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-family: sans-serif;
+            overflow: hidden;
+            z-index: 10;
+        }
+        
+        #webcam-container canvas {
+            width: 100% !important;
+            height: auto !important;
+            object-fit: cover;
+        }
+        
+        #label-container {
+            width: 100%;
+            background: rgba(0,0,0,0.7);
+            font-size: 0.75rem;
+            padding: 4px;
+        }
+        
+        #label-container div {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            padding: 2px 4px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- UI Overlay -->
+    <div class="absolute top-0 left-0 w-full p-6 flex justify-between items-start pointer-events-none z-10">
+        <div>
+            <h1 class="text-3xl font-bold text-white tracking-widest uppercase drop-shadow-md">Tilt Surfer</h1>
+            <p class="text-gray-300 text-sm mt-1">Controls: Head Tilt (Left/Right) or Arrow Keys</p>
+        </div>
+        <div class="text-right">
+            <p class="text-xl font-bold text-white">SCORE</p>
+            <p id="scoreDisplay" class="text-4xl font-black text-blue-400">0</p>
+        </div>
+    </div>
+
+    <!-- Game Over Screen -->
+    <div id="gameOverScreen" class="absolute inset-0 bg-black bg-opacity-80 flex flex-col items-center justify-center hidden z-20">
+        <h2 class="text-6xl font-black text-red-500 mb-4">CRASHED!</h2>
+        <p class="text-2xl text-white mb-8">Final Score: <span id="finalScoreDisplay" class="text-blue-400">0</span></p>
+        <button onclick="restartGame()" class="px-8 py-4 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-full text-xl transition-transform hover:scale-105 active:scale-95 pointer-events-auto">
+            PLAY AGAIN
+        </button>
+    </div>
+
+    <!-- Container for Teachable Machine Webcam -->
+    <div id="webcam-container">
+        <button id="start-webcam-btn" onclick="initML()" class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded text-white font-bold w-[90%] m-auto transition-colors pointer-events-auto">
+            Start Webcam
+        </button>
+        <div id="ml-content" class="hidden w-full h-full flex flex-col justify-between">
+            <canvas id="canvas"></canvas>
+            <div id="label-container"></div>
+        </div>
+    </div>
+
+    <script>
+        // --- GAME VARIABLES ---
+        let scene, camera, renderer;
+        let player;
+        let obstacles = [];
+        let score = 0;
+        let gameActive = true;
+        let speed = 0.4;
+        let lastSpawnTime = 0; // Added to track spawn cooldown
+        
+        // Lane definitions (Left, Center, Right)
+        const LANE_WIDTH = 3;
+        const LANES = [-LANE_WIDTH, 0, LANE_WIDTH];
+        let currentLane = 1; // Start in center (index 1)
+        let targetX = 0;
+
+        // Colors
+        const COLOR_PLAYER = 0x3b82f6; // Tailwind blue-500
+        const COLOR_OBSTACLE = 0xef4444; // Tailwind red-500
+        const COLOR_FLOOR = 0x1f2937; // Tailwind gray-800
+        const COLOR_GRID = 0x374151; // Tailwind gray-700
+
+        // --- ML VARIABLES ---
+        const URL = "https://teachablemachine.withgoogle.com/models/ZEb-1Fz9Z/"; 
+        let model, webcam, ctx, labelContainer, maxPredictions;
+        let lastMoveTime = 0; // Used to prevent rapid flickering between lanes
+        let centerHoldStartTime = 0; // Tracks how long the user has been in "center" pose
+
+        init();
+
+        function init() {
+            // 1. Setup Scene, Camera, Renderer
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0f172a); // dark slate
+            scene.fog = new THREE.Fog(0x0f172a, 10, 50);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 5, 10);
+            camera.lookAt(0, 0, -10);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // 2. Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(-10, 20, 10);
+            scene.add(dirLight);
+
+            // 3. Environment (Grid Floor)
+            const floorGeometry = new THREE.PlaneGeometry(30, 200);
+            const floorMaterial = new THREE.MeshStandardMaterial({ 
+                color: COLOR_FLOOR,
+                roughness: 0.8
+            });
+            const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+            floor.rotation.x = -Math.PI / 2;
+            floor.position.z = -50;
+            scene.add(floor);
+
+            const gridHelper = new THREE.GridHelper(30, 60, COLOR_GRID, COLOR_GRID);
+            gridHelper.position.set(0, 0.01, -50);
+            scene.add(gridHelper);
+
+            // 4. Player
+            const playerGeometry = new THREE.BoxGeometry(1.5, 1.5, 1.5);
+            const playerMaterial = new THREE.MeshStandardMaterial({ color: COLOR_PLAYER });
+            player = new THREE.Mesh(playerGeometry, playerMaterial);
+            player.position.set(LANES[currentLane], 0.75, 0);
+            scene.add(player);
+
+            // 5. Event Listeners
+            window.addEventListener('resize', onWindowResize, false);
+            window.addEventListener('keydown', handleKeyDown, false);
+
+            // 6. Start Loop
+            window.onload = () => {
+                animate();
+            };
+        }
+
+        // --- CONTROLS ---
+
+        function handleKeyDown(event) {
+            if (!gameActive) return;
+            if (event.key === 'ArrowLeft') movePlayer('left');
+            if (event.key === 'ArrowRight') movePlayer('right');
+        }
+
+        function movePlayer(direction) {
+            if (direction === 'left' && currentLane > 0) {
+                currentLane--;
+            } else if (direction === 'right' && currentLane < 2) {
+                currentLane++;
+            }
+            targetX = LANES[currentLane];
+            centerHoldStartTime = 0; // Reset this when using keyboard
+        }
+
+        // --- MACHINE LEARNING HOOK ---
+        function handleMLPrediction(className) {
+            if (!gameActive) return;
+
+            const now = Date.now();
+            const cName = className.toLowerCase();
+
+            if (cName.includes("left")) {
+                centerHoldStartTime = 0; // Reset center hold
+                if (currentLane !== 0 && now - lastMoveTime > 200) {
+                    currentLane = 0;
+                    targetX = LANES[currentLane];
+                    lastMoveTime = now;
+                }
+            } else if (cName.includes("right")) {
+                centerHoldStartTime = 0; // Reset center hold
+                if (currentLane !== 2 && now - lastMoveTime > 200) {
+                    currentLane = 2;
+                    targetX = LANES[currentLane];
+                    lastMoveTime = now;
+                }
+            } else if (cName.includes("center") || cName.includes("neutral") || cName.includes("straight") || cName.includes("none") || cName.includes("no tilt")) {
+                if (currentLane !== 1) {
+                    if (centerHoldStartTime === 0) {
+                        centerHoldStartTime = now;
+                    } else if (now - centerHoldStartTime > 150) { 
+                        // Require holding "center" for 150ms to filter out fast head sweeps
+                        currentLane = 1;
+                        targetX = LANES[currentLane];
+                        lastMoveTime = now;
+                        centerHoldStartTime = 0; 
+                    }
+                } else {
+                    centerHoldStartTime = 0;
+                }
+            }
+        }
+
+        // --- TEACHABLE MACHINE LOGIC ---
+        
+        async function initML() {
+            // Swap UI from Button to Canvas/Labels
+            document.getElementById('start-webcam-btn').classList.add('hidden');
+            document.getElementById('ml-content').classList.remove('hidden');
+
+            const modelURL = URL + "model.json";
+            const metadataURL = URL + "metadata.json";
+
+            try {
+                model = await tmPose.load(modelURL, metadataURL);
+                maxPredictions = model.getTotalClasses();
+
+                const size = 200;
+                const flip = true; 
+                webcam = new tmPose.Webcam(size, size, flip); 
+                await webcam.setup(); 
+                await webcam.play();
+                window.requestAnimationFrame(loop);
+
+                const canvas = document.getElementById("canvas");
+                canvas.width = size; canvas.height = size;
+                ctx = canvas.getContext("2d");
+                labelContainer = document.getElementById("label-container");
+                
+                // Clear any existing labels just in case
+                labelContainer.innerHTML = '';
+                
+                for (let i = 0; i < maxPredictions; i++) { 
+                    labelContainer.appendChild(document.createElement("div"));
+                }
+            } catch (error) {
+                console.error("Error loading model:", error);
+                document.getElementById('start-webcam-btn').classList.remove('hidden');
+                document.getElementById('ml-content').classList.add('hidden');
+                alert("Failed to load model. Check browser console for details.");
+            }
+        }
+
+        async function loop(timestamp) {
+            webcam.update(); 
+            await predict();
+            window.requestAnimationFrame(loop);
+        }
+
+        async function predict() {
+            if (!webcam.canvas) return;
+            
+            const { pose, posenetOutput } = await model.estimatePose(webcam.canvas);
+            const prediction = await model.predict(posenetOutput);
+
+            let highestProb = 0;
+            let bestClass = "";
+
+            for (let i = 0; i < maxPredictions; i++) {
+                const classPrediction = prediction[i].className + ": " + (prediction[i].probability * 100).toFixed(0) + "%";
+                if(labelContainer.childNodes[i]) {
+                    labelContainer.childNodes[i].innerHTML = classPrediction;
+                }
+                
+                // Find the class the model is most confident in right now
+                if (prediction[i].probability > highestProb) {
+                    highestProb = prediction[i].probability;
+                    bestClass = prediction[i].className;
+                }
+            }
+
+            // Only trigger a move if the AI is fairly confident (over 85%)
+            if (highestProb > 0.85) {
+                handleMLPrediction(bestClass);
+            }
+
+            drawPose(pose);
+        }
+
+        function drawPose(pose) {
+            if (webcam.canvas && ctx) {
+                ctx.drawImage(webcam.canvas, 0, 0);
+                if (pose) {
+                    const minPartConfidence = 0.5;
+                    tmPose.drawKeypoints(pose.keypoints, minPartConfidence, ctx);
+                    tmPose.drawSkeleton(pose.keypoints, minPartConfidence, ctx);
+                }
+            }
+        }
+
+        // --- GAME LOGIC ---
+
+        function spawnObstacle() {
+            const laneIndex = Math.floor(Math.random() * 3);
+            const geometry = new THREE.BoxGeometry(2, 2, 2);
+            const material = new THREE.MeshStandardMaterial({ color: COLOR_OBSTACLE });
+            const obstacle = new THREE.Mesh(geometry, material);
+            
+            obstacle.position.set(LANES[laneIndex], 1, -60); // Spawn far away
+            scene.add(obstacle);
+            obstacles.push(obstacle);
+        }
+
+        function updateObstacles() {
+            const now = Date.now();
+            // Spawn new obstacles randomly based on speed/score
+            // Enforce a strict minimum 1-second (1000ms) delay between spawns
+            if (now - lastSpawnTime > 1000 && Math.random() < 0.05 + (score * 0.0002)) { 
+                spawnObstacle();
+                lastSpawnTime = now;
+            }
+
+            for (let i = obstacles.length - 1; i >= 0; i--) {
+                let obs = obstacles[i];
+                obs.position.z += speed;
+
+                // Collision detection (AABB)
+                const dz = Math.abs(player.position.z - obs.position.z);
+                const dx = Math.abs(player.position.x - obs.position.x);
+
+                if (dz < 1.5 && dx < 1.5) {
+                    gameOver();
+                }
+
+                // Remove passed obstacles
+                if (obs.position.z > 5) {
+                    scene.remove(obs);
+                    obstacles.splice(i, 1);
+                    score += 10;
+                    document.getElementById('scoreDisplay').innerText = score;
+                    speed += 0.005; // Game gets progressively faster
+                }
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (gameActive) {
+                // Smoothly interpolate player position to the target lane (speed increased for snappier multi-lane jumps)
+                player.position.x += (targetX - player.position.x) * 0.22;
+                
+                // Add a little bounce to the player
+                player.position.y = 0.75 + Math.abs(Math.sin(Date.now() * 0.01)) * 0.2;
+
+                updateObstacles();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function gameOver() {
+            gameActive = false;
+            document.getElementById('gameOverScreen').classList.remove('hidden');
+            document.getElementById('finalScoreDisplay').innerText = score;
+        }
+
+        function restartGame() {
+            // Clean up obstacles
+            obstacles.forEach(obs => scene.remove(obs));
+            obstacles = [];
+            
+            // Reset variables
+            score = 0;
+            speed = 0.4;
+            lastSpawnTime = Date.now(); // Reset spawn timer
+            currentLane = 1;
+            targetX = LANES[currentLane];
+            player.position.x = targetX;
+            document.getElementById('scoreDisplay').innerText = score;
+            
+            // Hide game over screen and resume
+            document.getElementById('gameOverScreen').classList.add('hidden');
+            gameActive = true;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
