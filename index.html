@@ -109,7 +109,22 @@
         const MAX_LIVES = 3;
         let gameActive = false; 
         let gameStarted = false; 
-        let speed = 0.5; 
+        
+        // NEW SPEED & DIFFICULTY SYSTEM
+        const BASE_SPEED = 0.5;
+        const BASE_SPAWN_DELAY = 800;
+        
+        let gamePlayTime = 0;
+        let lastFrameTime = 0;
+        
+        let travelSpeedMultiplier = 0.9; // Base travel starts 10% slower
+        let speed = BASE_SPEED * travelSpeedMultiplier; 
+
+        let swappersUnlocked = false;
+        let swapperPhaseTimer = 0; // Tracks the 2-minute swapper difficulty curve
+        let swapperSpawnModifier = 0;
+        let swapperTravelModifier = 0;
+        
         let lastSpawnTime = 0; 
         let mountains1, mountains2; 
         let dashedLines = []; 
@@ -124,6 +139,7 @@
         const COLOR_PLAYER = 0x00ffff; // Bright Neon Cyan (Solid)
         const COLOR_ROAD = 0x050508; // Very dark track
         const COLOR_EDGE = 0xffaa00; // Glowing Orange
+        const COLOR_SWAPPER = 0xffcc00; // Bright Orange Yellow
 
         // --- ML VARIABLES ---
         const URL = "https://teachablemachine.withgoogle.com/models/ZEb-1Fz9Z/"; 
@@ -131,6 +147,8 @@
         let lastMoveTime = 0; 
         let centerHoldStartTime = 0; 
         let obstacleTex; 
+        let swapperTex; // New texture for the swapper obstacle
+        let hitPenalty = 0; // Tracks the non-stacking hit slow
 
         // Helper to generate thick borders and stripes for obstacles
         function createObstacleTexture() {
@@ -162,15 +180,41 @@
             return new THREE.CanvasTexture(canvas);
         }
 
+        // Helper to generate horizontal stripes for swapper obstacles
+        function createSwapperTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const context = canvas.getContext('2d');
+
+            // Dark background
+            context.fillStyle = '#0a0005';
+            context.fillRect(0, 0, 512, 512);
+
+            // Horizontal Neon Orange/Yellow Stripes
+            context.fillStyle = '#ffcc00'; 
+            for(let i = 0; i < 512; i += 128) {
+                context.fillRect(0, i + 32, 512, 64);
+            }
+
+            // Thick Neon Orange/Yellow Border
+            context.strokeStyle = '#ffcc00';
+            context.lineWidth = 40; 
+            context.strokeRect(20, 20, 472, 472);
+
+            return new THREE.CanvasTexture(canvas);
+        }
+
         init();
 
         function init() {
             obstacleTex = createObstacleTexture();
+            swapperTex = createSwapperTexture();
 
             // 1. Setup Scene, Camera, Renderer
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x1a0b2e); 
-            scene.fog = new THREE.Fog(0x1a0b2e, 40, 200); 
+            scene.fog = new THREE.Fog(0x1a0b2e, 36, 180); // Reduced visibility by 10%
 
             camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 400); 
             camera.position.set(0, 6, 12); 
@@ -398,6 +442,7 @@
                 document.getElementById('startScreen').classList.add('hidden');
                 document.getElementById('webcam-container').classList.remove('hidden');
                 lastSpawnTime = Date.now(); 
+                lastFrameTime = Date.now(); // Start timers cleanly
             }
 
             if (highestProb > 0.85) {
@@ -448,19 +493,63 @@
         }
 
         function spawnObstacle() {
-            const laneIndex = Math.floor(Math.random() * 3);
-            let entity;
-
             // Count how many hearts are currently on the track
             let heartsOnTrack = obstacles.filter(obs => obs.userData && obs.userData.type === 'heart').length;
 
             // Strict limit: Player Lives + Hearts on Track must be less than MAX_LIVES
             if ((lives + heartsOnTrack) < MAX_LIVES && Math.random() < 0.1) {
-                entity = createHeartMesh();
+                const laneIndex = Math.floor(Math.random() * 3);
+                let entity = createHeartMesh();
                 entity.userData = { type: 'heart', rotationSpeed: 0.05 };
-                entity.position.set(LANES[laneIndex], 0, -180); 
+                entity.position.set(LANES[laneIndex], 0, -162); // Spawns 10% closer
+                scene.add(entity);
+                obstacles.push(entity);
+            } else if (score >= 800 && Math.random() < 0.25) {
+                // Swapper Obstacle: Spawns at score 800+
+                const laneIndex = Math.floor(Math.random() * 3);
+                const geometry = new THREE.BoxGeometry(2, 2, 2);
+                const material = new THREE.MeshStandardMaterial({ 
+                    map: swapperTex,
+                    emissiveMap: swapperTex,
+                    emissive: 0xffffff,
+                    emissiveIntensity: 1.0,
+                    roughness: 0.2
+                }); 
+                let entity = new THREE.Mesh(geometry, material);
+
+                // Lowered back to 1.0 so the 2x2x2 block rests perfectly flush with the ground
+                entity.position.set(LANES[laneIndex], 1.0, -162); 
+                entity.userData = { type: 'swapper', hasSwapped: false, targetX: LANES[laneIndex] };
+                scene.add(entity);
+                obstacles.push(entity);
+            } else if (score >= 400 && Math.random() < 0.25) {
+                // Double Red Obstacle: Spawns at score 400+. Occupies 2 lanes.
+                const emptyLaneIndex = Math.floor(Math.random() * 3);
+                const occupiedLanes = [0, 1, 2].filter(i => i !== emptyLaneIndex);
+                let isFirst = true; // Used to prevent double-scoring
+                
+                occupiedLanes.forEach(idx => {
+                    const geometry = new THREE.BoxGeometry(2, 2, 2);
+                    const material = new THREE.MeshStandardMaterial({ 
+                        map: obstacleTex,
+                        emissiveMap: obstacleTex,
+                        emissive: 0xffffff,
+                        emissiveIntensity: 1.0,
+                        roughness: 0.2
+                    }); 
+                    let entity = new THREE.Mesh(geometry, material);
+                    
+                    entity.position.set(LANES[idx], 1.0, -162); 
+                    // Only score points for the first block to prevent double-scoring a row
+                    entity.userData = { type: 'obstacle', scoresPoints: isFirst };
+                    isFirst = false;
+                    
+                    scene.add(entity);
+                    obstacles.push(entity);
+                });
             } else {
-                // Obstacle: Dark body, thick Red/Orange Neon Striped Texture
+                // Single Red Obstacle: Dark body, thick Red/Orange Neon Striped Texture
+                const laneIndex = Math.floor(Math.random() * 3);
                 const geometry = new THREE.BoxGeometry(2, 2, 2);
                 const material = new THREE.MeshStandardMaterial({ 
                     map: obstacleTex,
@@ -469,21 +558,33 @@
                     emissiveIntensity: 1.0,
                     roughness: 0.2
                 }); 
-                entity = new THREE.Mesh(geometry, material);
+                let entity = new THREE.Mesh(geometry, material);
 
-                // Lowered back to 1.0 so the 2x2x2 block rests perfectly flush with the ground (0 hover height)
-                entity.position.set(LANES[laneIndex], 1.0, -180); 
+                // Lowered back to 1.0 so the 2x2x2 block rests perfectly flush with the ground
+                entity.position.set(LANES[laneIndex], 1.0, -162); 
                 entity.userData = { type: 'obstacle' };
+                scene.add(entity);
+                obstacles.push(entity);
             }
-            
-            scene.add(entity);
-            obstacles.push(entity);
         }
 
         function updateObstacles() {
             const now = Date.now();
             
-            if (now - lastSpawnTime > 800 && Math.random() < 0.05 + (score * 0.0002)) { 
+            // Unlock swappers
+            if (score >= 800 && !swappersUnlocked) {
+                swappersUnlocked = true;
+            }
+
+            // Calculate effective spawn multiplier based on playtime and swapper phase modifier
+            const timeProgress = Math.min(1.0, gamePlayTime / 120000); 
+            const baseSpawnMultiplier = 0.90 + (timeProgress * 0.25) + ((lives - 1) * 0.05);
+            const effectiveSpawnMultiplier = Math.max(0.5, baseSpawnMultiplier + swapperSpawnModifier);
+
+            // Maintain exact visual distance between obstacles regardless of their travel speed
+            const currentSpawnDelay = (BASE_SPAWN_DELAY / effectiveSpawnMultiplier) * (BASE_SPEED / speed);
+            
+            if (now - lastSpawnTime > currentSpawnDelay && Math.random() < 0.05 + (score * 0.0002)) { 
                 spawnObstacle();
                 lastSpawnTime = now;
             }
@@ -491,6 +592,24 @@
             for (let i = obstacles.length - 1; i >= 0; i--) {
                 let obs = obstacles[i];
                 obs.position.z += speed;
+
+                // Handle Swapper lane sliding logic
+                if (obs.userData && obs.userData.type === 'swapper') {
+                    // Check if past 65% of the track (Starting at -162. 65% of 162 is 105.3. -162 + 105.3 = -56.7)
+                    if (!obs.userData.hasSwapped && obs.position.z > -56.7) {
+                        obs.userData.hasSwapped = true;
+                        
+                        // Pick a random lane that is NOT the current lane
+                        const availableLanes = LANES.filter(lane => lane !== obs.userData.targetX);
+                        const randomLaneIndex = Math.floor(Math.random() * availableLanes.length);
+                        obs.userData.targetX = availableLanes[randomLaneIndex];
+                    }
+                    
+                    // Smoothly slide to target lane
+                    if (obs.userData.hasSwapped) {
+                        obs.position.x += (obs.userData.targetX - obs.position.x) * 0.15;
+                    }
+                }
 
                 const dz = Math.abs(player.position.z - obs.position.z);
                 const dx = Math.abs(player.position.x - obs.position.x);
@@ -508,6 +627,9 @@
                         scene.remove(obs);
                         obstacles.splice(i, 1);
                         
+                        // Instantly set a flat 15% penalty on hit (does not stack)
+                        hitPenalty = 0.15;
+
                         player.material.color.setHex(0xffffff);
                         setTimeout(() => player.material.color.setHex(COLOR_PLAYER), 150);
 
@@ -522,10 +644,11 @@
                     scene.remove(obs);
                     obstacles.splice(i, 1);
                     
-                    if (obs.userData && obs.userData.type === 'obstacle') {
-                        score += 10;
-                        document.getElementById('scoreDisplay').innerText = score;
-                        speed += 0.005; 
+                    if (obs.userData && (obs.userData.type === 'obstacle' || obs.userData.type === 'swapper')) {
+                        if (obs.userData.scoresPoints !== false) { // Don't score double for the 'double red' obstacle
+                            score += 10;
+                            document.getElementById('scoreDisplay').innerText = score;
+                        }
                     }
                 }
             }
@@ -534,7 +657,43 @@
         function animate() {
             requestAnimationFrame(animate);
 
+            const now = Date.now();
+            if (lastFrameTime === 0) lastFrameTime = now;
+            const deltaTime = now - lastFrameTime;
+            lastFrameTime = now;
+
             if (gameActive) {
+                // Update time played 
+                gamePlayTime += deltaTime;
+                
+                // Process the 2-minute Swapper Difficulty Phase
+                if (swappersUnlocked) {
+                    swapperPhaseTimer += deltaTime;
+                    
+                    // Phase 1 (0 to 60s): Spawn rate drops 15%, slowly recovers 10%
+                    const phase1Progress = Math.min(1.0, swapperPhaseTimer / 60000);
+                    swapperSpawnModifier = -0.15 + (0.10 * phase1Progress);
+                    
+                    // Phase 2 (60s to 120s): Travel speed increases by 10%
+                    if (swapperPhaseTimer > 60000) {
+                        const phase2Progress = Math.min(1.0, (swapperPhaseTimer - 60000) / 60000);
+                        swapperTravelModifier = 0.10 * phase2Progress;
+                    }
+                }
+
+                // Base travel speed scales from 0.9 to 1.05 over the first minute (60,000ms)
+                const travelProgress = Math.min(1.0, gamePlayTime / 60000);
+                travelSpeedMultiplier = 0.9 + (0.15 * travelProgress);
+
+                // Recover hit penalty by 15% (0.15) over 1 minute (60,000ms)
+                if (hitPenalty > 0) {
+                    const penaltyRecoveryRate = 0.15 / 60000;
+                    hitPenalty = Math.max(0, hitPenalty - (penaltyRecoveryRate * deltaTime));
+                }
+                
+                // Combine base travel speed with the hit penalty and Swapper Phase 2 modifier
+                speed = BASE_SPEED * (travelSpeedMultiplier - hitPenalty + swapperTravelModifier);
+
                 player.position.x += (targetX - player.position.x) * 0.22;
                 player.position.y = 0.75 + Math.abs(Math.sin(Date.now() * 0.01)) * 0.2;
 
@@ -574,8 +733,20 @@
             
             score = 0;
             lives = 1; 
-            speed = 0.5;
+            
+            // Reset Time & Speed System
+            gamePlayTime = 0;
+            travelSpeedMultiplier = 0.9;
+            hitPenalty = 0;
+            speed = BASE_SPEED * travelSpeedMultiplier;
+            swappersUnlocked = false;
+            swapperPhaseTimer = 0;
+            swapperSpawnModifier = 0;
+            swapperTravelModifier = 0;
+            
             lastSpawnTime = Date.now(); 
+            lastFrameTime = Date.now(); 
+            
             currentLane = 1;
             targetX = LANES[currentLane];
             player.position.x = targetX;
